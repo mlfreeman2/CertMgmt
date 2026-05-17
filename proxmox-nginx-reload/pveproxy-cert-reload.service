@@ -1,0 +1,6 @@
+[Unit]
+Description=Reload nginx after pveproxy cert change
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nginx -s reload

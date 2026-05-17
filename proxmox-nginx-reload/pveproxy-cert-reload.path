@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch pveproxy TLS cert for changes and reload nginx
+
+[Path]
+PathModified=/etc/pve/local/pveproxy-ssl.pem
+
+[Install]
+WantedBy=multi-user.target

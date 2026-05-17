@@ -1,0 +1,15 @@
+deploy-config.json
+deploy-config-*.json
+!deploy-config-SAMPLE.json
+cloudflare.ini
+cloudflare-*.ini
+!cloudflare-SAMPLE.ini
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+ssl-scan-*.txt
+ssl-inventory-*.txt
+.env
+.DS_Store

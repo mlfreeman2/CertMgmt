@@ -1,0 +1,110 @@
+{
+  "site_name": "CHANGEME",
+  "email": "admin@CHANGEME.example.com",  "_email_comment": "optional — omit to register without email (no expiry warnings from LE)",
+  "healthchecks_url": "https://hc.example.com/ping/YOUR-UUID-HERE",
+  "cert_driver_dir": "/etc/letsencrypt/cert-drivers",
+  "log_file": "/var/log/cert-deploy.log",
+  "certs": {
+    "CHANGEME.example.com-wildcard": {
+      "domains": ["*.CHANGEME.example.com"],
+      "key_type": "rsa",
+      "key_size": 2048,
+      "targets": [
+
+        {
+          "_comment": "Dell iDRAC -- Redfish API, uses fullchain.pem",
+          "name": "my-idrac",
+          "driver": "idrac",
+          "ip": "192.168.1.10",
+          "username": "root",
+          "password": "CHANGEME",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "GL.iNet KVM -- KVMD API, uses cert.pem (leaf only)",
+          "name": "my-kvm",
+          "driver": "glinet-kvm",
+          "ip": "192.168.1.11",
+          "username": "admin",
+          "password": "CHANGEME",
+          "cert_file": "cert.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "TrueNAS Scale -- WebSocket API, uses fullchain.pem",
+          "name": "my-nas",
+          "driver": "truenas-scale",
+          "ip": "192.168.1.12",
+          "api_key": "CHANGEME",
+          "domain": "CHANGEME.example.com",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "Supermicro IPMI -- X10 or X11, uses fullchain.pem",
+          "name": "my-ipmi",
+          "driver": "supermicro-ipmi",
+          "ip": "192.168.1.13",
+          "username": "ADMIN",
+          "password": "CHANGEME",
+          "model": "X10",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "Reolink camera -- requires RSA cert; uses JSON API over HTTPS",
+          "name": "my-camera",
+          "driver": "reolink",
+          "ip": "192.168.1.21",
+          "username": "admin",
+          "password": "CHANGEME",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "Brother printer -- requires RSA cert; pip install cryptography on the host",
+          "name": "office-printer",
+          "driver": "brother-printer",
+          "ip": "192.168.1.20",
+          "username": "admin",
+          "password": "CHANGEME",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "Proxmox VE -- REST API on port 8006, uses fullchain.pem",
+          "name": "my-proxmox",
+          "driver": "proxmox",
+          "ip": "192.168.1.50",
+          "api_token": "root@pam!certmgmt=CHANGEME-UUID",
+          "node": "pve",
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem"
+        },
+
+        {
+          "_comment": "Docker Compose -- restarts listed services, verify_host needed for cert check",
+          "name": "my-caddy",
+          "driver": "docker-compose",
+          "compose_dir": "/home/user/myproject",
+          "services": ["caddy"],
+          "verify_host": "127.0.0.1",
+          "verify_cert_file": "cert.pem"
+        }
+
+      ]
+    },
+    "CHANGEME.example.com": {
+      "domains": ["CHANGEME.example.com"],
+      "key_type": "rsa",
+      "targets": []
+    }
+  }
+}
