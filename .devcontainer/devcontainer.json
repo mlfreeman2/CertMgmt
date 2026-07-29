@@ -6,7 +6,11 @@
       "version": "lts"
     }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq curl openssl shellcheck ncat nmap certbot python3-certbot-dns-cloudflare httpie && pip install --user requests websockets cryptography lxml && npm install -g @anthropic-ai/claude-code",
+  "postCreateCommand": {
+    "system-packages": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq curl openssl shellcheck ncat nmap certbot python3-certbot-dns-cloudflare httpie",
+    "python-deps": "pip install --user -r ${containerWorkspaceFolder}/requirements.txt ruff",
+    "claude-code": "npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
@@ -30,6 +34,7 @@
             "source.organizeImports.ruff": "explicit"
           }
         },
+        "ruff.importStrategy": "fromEnvironment",
         "shellcheck.enable": true,
         "shellcheck.executablePath": "shellcheck"
       }
