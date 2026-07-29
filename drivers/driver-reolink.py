@@ -123,7 +123,8 @@ def main():
         "-H",
         "--host",
         required=True,
-        help="Camera IP or hostname (https:// will be prepended)",
+        help="Camera IP or hostname (https:// will be prepended). Prefer the IP: "
+        "some models reject URLs whose hostname exceeds ~32 characters",
     )
     parser.add_argument(
         "-u", "--username", required=True, help='Camera username (usually "admin")'
@@ -205,6 +206,9 @@ def main():
     if not args.no_verify:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         verify_script = os.path.join(script_dir, "verify-deployed-cert.sh")
+        # Reolink cameras can take several minutes after ImportCertificate to
+        # restart their web daemon and serve the new cert; allow ~10 minutes
+        # (30s wait + 19 retries at 30s intervals) before calling it a failure.
         result = subprocess.run(
             [
                 verify_script,
@@ -213,9 +217,9 @@ def main():
                 "--cert-file",
                 args.cert_file,
                 "--wait",
-                "15",
+                "30",
                 "--retries",
-                "3",
+                "19",
             ],
         )
         sys.exit(result.returncode)

@@ -1,7 +1,6 @@
 {
   "site_name": "CHANGEME",
   "email": "admin@CHANGEME.example.com",  "_email_comment": "optional — omit to register without email (no expiry warnings from LE)",
-  "healthchecks_url": "https://hc.example.com/ping/YOUR-UUID-HERE",
   "cert_driver_dir": "/etc/letsencrypt/cert-drivers",
   "log_file": "/var/log/cert-deploy.log",
   "certs": {
@@ -9,6 +8,7 @@
       "domains": ["*.CHANGEME.example.com"],
       "key_type": "rsa",
       "key_size": 2048,
+      "healthchecks_url": "https://hc.example.com/ping/THIS-CERTS-UUID-HERE",
       "targets": [
 
         {
@@ -57,13 +57,13 @@
         },
 
         {
-          "_comment": "Reolink camera -- requires RSA cert; uses JSON API over HTTPS",
+          "_comment": "Reolink camera -- requires RSA cert and a single leaf cert (cert.pem, never fullchain.pem); connect by IP, long hostnames break some models",
           "name": "my-camera",
           "driver": "reolink",
           "ip": "192.168.1.21",
           "username": "admin",
           "password": "CHANGEME",
-          "cert_file": "fullchain.pem",
+          "cert_file": "cert.pem",
           "key_file": "privkey.pem"
         },
 
@@ -80,11 +80,13 @@
 
         {
           "_comment": "Proxmox VE -- REST API on port 8006, uses fullchain.pem",
+          "_verify_ports_comment": "verify_ports is optional (default [8006]); add 443 if an nginx on the PVE host serves the same cert -- see proxmox-nginx-reload/",
           "name": "my-proxmox",
           "driver": "proxmox",
           "ip": "192.168.1.50",
           "api_token": "root@pam!certmgmt=CHANGEME-UUID",
           "node": "pve",
+          "verify_ports": [8006, 443],
           "cert_file": "fullchain.pem",
           "key_file": "privkey.pem"
         },

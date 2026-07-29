@@ -2,6 +2,8 @@
 
 Config-driven Let's Encrypt certificate management with automatic deployment to network devices.
 
+> **Disclosure:** All code in this repository was written by [Claude Code](https://claude.com/claude-code), Anthropic's AI coding tool, working under my direction. I designed the system, reviewed the code, and tested every driver against real hardware on my own network (see [Tested Hardware](#tested-hardware)). That said, treat it like anything else you find on the internet: read it before pointing it at devices you care about.
+
 ## How It Works
 
 - **certbot** fetches and renews certificates via Cloudflare DNS-01 challenge
@@ -30,6 +32,7 @@ CertMgmt/
     driver-brother-printer.py     # Brother printers (HTTP forms + PKCS#12)
     driver-proxmox.py             # Proxmox VE (REST API, port 8006)
     verify-deployed-cert.sh       # Shared post-deployment verification helper
+  proxmox-nginx-reload/           # Optional: systemd units to reload nginx on a PVE host when the cert changes
 ```
 
 After `certbot-setup.sh` runs, copies live in `/etc/letsencrypt/`:
@@ -265,14 +268,63 @@ Both require `nmap` and `openssl`. `scan-ssl-certs.sh` also requires `jq`.
 | `brother-printer` | driver-brother-printer.py | Brother network printers via HTTP forms |
 | `proxmox` | driver-proxmox.py | Proxmox VE via REST API (port 8006) |
 
+## Driver Notes
+
+### Proxmox: nginx on the PVE host is optional
+
+The proxmox driver only talks to the Proxmox API on port 8006 -- it uploads the cert to `pveproxy`, which restarts itself. Nothing in this system requires nginx.
+
+That said, a common convenience is running nginx on the PVE host so you don't have to remember `:8006` -- listening on 443 with the same cert and redirecting to `https://<host>:8006`. If you do this:
+
+- Point nginx at `/etc/pve/local/pveproxy-ssl.pem` (the API-uploaded cert), **not** the self-signed `pve-ssl.pem` -- otherwise nginx keeps serving the old self-signed cert forever.
+- nginx does not notice when the driver uploads a new cert. Install the systemd path unit in [proxmox-nginx-reload/](proxmox-nginx-reload/) to reload nginx automatically on cert changes.
+- To have `cert-sync.sh -D --dry-run` verify nginx's copy too, set `"verify_ports": [8006, 443]` on the proxmox target in deploy-config.json. The default is `[8006]` only, so hosts without nginx verify cleanly.
+
+### Reolink: connect by IP, keep hostnames short
+
+Reolink firmware is the quirkiest of the supported devices:
+
+- **~32-character hostname limit.** The camera's HTTP stack misbehaves (401 errors, odd API behavior) when the URL hostname exceeds roughly 32 characters -- [documented in the field for RTSP](https://github.com/blakeblackshear/frigate/discussions/11214) and observed here with the HTTPS API as well. Use the camera's IP in deploy-config.json (the `ip` field does this naturally) and keep the camera's own device name short. The certificate itself can still carry a long wildcard domain; only the connection URL matters.
+- **RSA only.** The cameras reject ECDSA certs -- set `"key_type": "rsa"` on the cert. The driver checks this before uploading.
+- **Single leaf cert only.** Upload `cert.pem`, never `fullchain.pem` -- the camera rejects chains. The driver checks this too.
+- **Slow to apply.** Cameras can take minutes to serve a newly uploaded cert, and [some models (e.g. E1 Pro) need a full reboot](https://gist.github.com/velzend/895c18d533b3992f3a0cc128f27c0894); the driver polls for up to ~10 minutes before declaring failure.
+- **Re-import quirks on some models.** Some firmware won't overwrite an existing cert without a `CertificateClear` call first (not needed on the hardware tested here; see the gist above if you hit it).
+
+### RSA-only devices
+
+Reolink cameras, Supermicro IPMI (X10/X11), and Brother printers all reject ECDSA certificates -- set `"key_type": "rsa"` on any cert that deploys to them. All three drivers check the cert before uploading and fail with a clear error rather than leaving the device in a half-configured state.
+
+## Tested Hardware
+
+Every driver has been exercised against the devices below. Other models/firmware may work but haven't been verified — if a driver works on hardware not listed here, an issue or PR adding it is welcome.
+
+| Driver | Device | HW Revision | Firmware Version | Notes |
+|---|---|---|---|---|
+| `idrac` | PowerEdge T340 w/ 14G Monolithic | 0.01 | 7.00.00.174 | Tested with an Enterprise license; unverified whether Express/Basic suffices |
+| `glinet-kvm` | GL-RM1PE | n/a | 1.8.0 Release 1 | 3 of them, at 3 locations |
+| `docker-compose` | n/a -- local services | n/a | n/a | Restarts one or more containers. Requires /etc/letsencrypt mapped in to target containers. Only tested with caddy. |
+| `truenas-scale` | n/a -- appliance OS | n/a | 25.10.1 | Uses the WebSocket JSON-RPC API |
+| `supermicro-ipmi` | X11SDV-8C-TP8F | n/a | IPMI 01.25 (08/31/2018) | RSA certs only (see Driver Notes) |
+| `supermicro-ipmi` | X10SDV-TLN4F | n/a | IPMI 03.88 (02/21/2020) | RSA certs only (see Driver Notes) |
+| `reolink` | CX410 | IPC_NT1NA44MP | v3.1.0.3429_2404181313 | 3 of these. Slow to apply certs (see Driver Notes) |
+| `reolink` | CX410W | IPC_NT1NA44MP | v3.1.0.4366_2412021479 | 2 of these. Slow to apply certs (see Driver Notes) |
+| `reolink` | RLC-810WA | IPC_MS2NA48MP | v3.0.0.2737_23092700 | One of two units, each on its own firmware. Slow to apply certs (see Driver Notes) |
+| `reolink` | RLC-810WA | IPC_MS2NA48MP | v3.0.0.5032_2506271657 | One of two units, each on its own firmware. Slow to apply certs (see Driver Notes) |
+| `brother-printer` | HL-L3280CDW series | | MAIN 1.10 SUB3 2306291143 | RSA certs only (see Driver Notes) |
+| `proxmox` | n/a -- hypervisor OS | n/a | pve-manager 9.1.4 | Single node, with nginx on 443 serving the same cert (see Driver Notes) |
+
 ## Notifications (Optional)
 
-The dispatcher can ping a [Healthchecks.io](https://healthchecks.io/) check on each cert deployment. Add `healthchecks_url` to your `deploy-config.json`:
+The dispatcher can ping a [Healthchecks.io](https://healthchecks.io/) check on each cert deployment. Add a `healthchecks_url` to each cert in `deploy-config.json`:
 
 ```json
 {
-  "healthchecks_url": "https://hc.example.com/ping/YOUR-UUID-HERE",
-  ...
+  "certs": {
+    "example.com-wildcard": {
+      "healthchecks_url": "https://hc.example.com/ping/THIS-CERTS-UUID",
+      ...
+    }
+  }
 }
 ```
 
@@ -280,7 +332,9 @@ This gives you:
 - **Failure alerts** -- immediate notification when a deployment fails
 - **Heartbeat monitoring** -- if certbot stops renewing (cron broken, machine down), the missed ping triggers an alert before certs expire
 
-The field is optional. If omitted, no pings are sent and behavior is unchanged.
+Use a dedicated check per cert. Certbot invokes the dispatcher once per renewed cert, so if certs shared a check the last cert to deploy would overwrite the check's status -- a cert that deploys cleanly could flip a check back to passing and mask another cert's failure.
+
+The field is optional. Certs without it send no pings, and certs with no deployment targets never ping their check.
 
 ## Disaster Recovery
 
