@@ -16,7 +16,8 @@
     // Claude Code auth + config + memory, SHARED across all local devcontainers
     // (one login everywhere; CLAUDE_CONFIG_DIR below must point at the target).
     // Create the host folder before first use: a bind mount fails if its source does not exist.
-    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude-devcontainers,target=/home/vscode/.claude,type=bind,consistency=cached"
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude-devcontainers,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.codex-devcontainers,target=/home/vscode/.codex,type=bind,consistency=cached",
   ],
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
