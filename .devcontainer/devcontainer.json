@@ -1,6 +1,6 @@
 {
   "name": "CertMgmt Driver Dev",
-  "image": "mcr.microsoft.com/devcontainers/python:3",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14",
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
       "version": "lts"
@@ -8,7 +8,7 @@
   },
   "postCreateCommand": {
     "system-packages": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq curl openssl shellcheck ncat nmap certbot python3-certbot-dns-cloudflare httpie",
-    "python-deps": "pip install --user -r ${containerWorkspaceFolder}/requirements.txt ruff",
+    "python-deps": "cd ${containerWorkspaceFolder} && python -m pip install uv==0.13.5 && uv sync --locked",
     "claude-code": "npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code",
     "claude-dir": "sudo chown -R vscode:vscode /home/vscode/.claude"
   },
@@ -37,7 +37,7 @@
         "openai.chatgpt"
       ],
       "settings": {
-        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
         "editor.formatOnSave": true,
         "[python]": {
           "editor.defaultFormatter": "charliermarsh.ruff",

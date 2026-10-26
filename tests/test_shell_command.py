@@ -1,345 +1,237 @@
-"""Offline process tests. No root, network access, or installed CertMgmt files needed.
+"""Exercise real child processes, cancellation and the public driver CLI offline."""
 
-Copies of the orchestration scripts redirect /etc/letsencrypt into a temporary
-fixture. Only the copied cert-sync root guard is bypassed. SSH/verification and
-healthchecks are local stand-ins; the real driver and dispatcher logic execute.
-"""
-
-import json
-import os
-import shutil
+import shlex
 import subprocess
-import tempfile
+import sys
 import time
-import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+import pytest
+
+from certmgmt.errors import ConfigurationError, DeploymentError
+from certmgmt.registry import deploy, prepare
 
 
-class ShellCommandTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="certmgmt-test-")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.drivers = self.root / "drivers"
-        self.drivers.mkdir()
-        self.driver = self.drivers / "driver-shell-command.sh"
-        shutil.copy2(REPO / "drivers" / self.driver.name, self.driver)
-        self.lineage = self.root / "live" / "test-lineage"
-        self.lineage.mkdir(parents=True)
-        for name, content in [
-            ("privkey.pem", "TEST KEY\n"),
-            ("fullchain.pem", "TEST CHAIN\n"),
-            ("cert.pem", "TEST LEAF\n"),
-        ]:
-            (self.lineage / name).write_text(content)
-        self.marker = self.root / "delivered"
-        self.verify_log = self.root / "verify-args"
-        self.hc_log = self.root / "healthchecks"
-        self.env = os.environ.copy()
-        self.env.update(
+def invoke(command, *args):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "certmgmt",
+            "driver",
+            "shell-command",
+            "--command",
+            command,
+            *map(str, args),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_stream_paths_with_spaces_and_chdir(tmp_path, pem_pairs):
+    marker = tmp_path / "stream"
+    cert, key = pem_pairs["rsa"]
+    result = invoke(
+        'pwd; cat "$KEY_FILE" "$CERT_FILE" > ' + shlex.quote(str(marker)),
+        "--cert-file",
+        cert,
+        "--key-file",
+        key,
+        "--chdir",
+        tmp_path,
+        "--no-verify",
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(tmp_path) in result.stderr
+    assert marker.read_bytes() == Path(key).read_bytes() + Path(cert).read_bytes()
+
+
+@pytest.mark.parametrize("command", ['read -r value; test -z "$value"', "true"])
+def test_closed_stdin_and_zero_command_timeout(command):
+    result = invoke(command, "--timeout", "0", "--no-verify")
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("command", ["false | cat", "exit 7"])
+def test_command_failure(command):
+    result = invoke(command, "--no-verify")
+    assert result.returncode == 1
+    assert "command failed" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args", [("--timeout", "1"), ("--timeout", "0", "--operation-timeout", "1")]
+)
+def test_timeout_stops_descendants(tmp_path, args):
+    marker = tmp_path / "late"
+    result = invoke(
+        "(sleep 2; touch " + shlex.quote(str(marker)) + ") & wait", "--no-verify", *args
+    )
+    assert result.returncode == 1
+    time.sleep(1.5)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"timeout": -1},
+        {"timeout": True},
+        {"operation_timeout": 0},
+        {"verify_port": 0},
+        {"chdir": "/nonexistent-certmgmt-test"},
+        {"command": ""},
+    ],
+)
+def test_invalid_options_before_delivery(values):
+    with pytest.raises(ConfigurationError):
+        prepare("shell-command", {"command": "true", "no_verify": True} | values)
+
+
+def test_missing_verification_before_delivery(tmp_path):
+    marker = tmp_path / "marker"
+    result = invoke("touch " + shlex.quote(str(marker)))
+    assert result.returncode == 2
+    assert not marker.exists()
+
+
+def test_certificate_mismatch_before_delivery(tmp_path, pem_pairs):
+    marker = tmp_path / "marker"
+    result = invoke(
+        "touch " + shlex.quote(str(marker)),
+        "--cert-file",
+        pem_pairs["rsa"][0],
+        "--key-file",
+        pem_pairs["ec"][1],
+        "--no-verify",
+    )
+    assert result.returncode == 2
+    assert not marker.exists()
+
+
+def test_failed_post_delivery_verification(tmp_path, pem_pairs, monkeypatch):
+    marker = tmp_path / "marker"
+    request = prepare(
+        "shell-command",
+        {
+            "command": "touch " + shlex.quote(str(marker)),
+            "verify_host": "example.test",
+            "verify_cert_file": pem_pairs["rsa"][0],
+        },
+    )
+
+    def fail(*args, **kwargs):
+        raise DeploymentError("mismatch")
+
+    monkeypatch.setattr("certmgmt.registry.verify", fail)
+    with pytest.raises(DeploymentError):
+        deploy(request)
+    assert marker.exists()
+
+
+def test_private_key_and_command_not_logged(pem_pairs):
+    cert, key = pem_pairs["rsa"]
+    result = invoke(
+        'cat "$KEY_FILE"',
+        "--cert-file",
+        cert,
+        "--key-file",
+        key,
+        "--no-verify",
+        "--debug",
+    )
+    assert result.returncode == 0
+    assert "PRIVATE KEY-----" not in result.stderr
+    assert 'cat "$KEY_FILE"' not in result.stderr
+    assert "<private key redacted>" in result.stderr
+
+
+def test_quiet():
+    result = invoke("echo output", "--no-verify", "--quiet")
+    assert result.returncode == 0
+    assert not result.stdout and not result.stderr
+
+
+def test_docker_services_and_working_directory(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "certmgmt.drivers.dispatch.run_command",
+        lambda argv, **kwargs: calls.append((argv, kwargs)),
+    )
+    deploy(
+        prepare(
+            "docker-compose",
             {
-                "DELIVERED_FILE": str(self.marker),
-                "VERIFY_LOG": str(self.verify_log),
-                "VERIFY_MODE": "after-delivery",
-                "HC_LOG": str(self.hc_log),
-            }
+                "compose_dir": str(tmp_path),
+                "service": ["caddy", "other"],
+                "no_verify": True,
+            },
         )
-        self.write_executable(
-            self.drivers / "verify-deployed-cert.sh",
-            """#!/bin/bash
-printf '%s\\0' "$@" >> "$VERIFY_LOG"
-case "$VERIFY_MODE" in
-  pass) exit 0 ;;
-  fail) exit 1 ;;
-  after-delivery) test -f "$DELIVERED_FILE" ;;
-esac
-""",
-        )
-        self.write_executable(
-            self.drivers / "curl",
-            """#!/bin/bash
-printf '%s\\n' "${@: -1}" >> "$HC_LOG"
-""",
-        )
-        self.env["PATH"] = str(self.drivers) + os.pathsep + self.env["PATH"]
-        self.config_path = self.root / "deploy-config.json"
-        self.dispatcher = self.copy_orchestrator("cert-dispatcher.sh")
-        self.sync = self.copy_orchestrator("cert-sync.sh")
-
-    @staticmethod
-    def write_executable(path, content):
-        path.write_text(content)
-        path.chmod(0o755)
-
-    def copy_orchestrator(self, name):
-        source = (REPO / name).read_text()
-        self.assertIn("/etc/letsencrypt", source)
-        source = source.replace("/etc/letsencrypt", str(self.root))
-        if name == "cert-sync.sh":
-            guard = 'if [ "$EUID" -ne 0 ]; then'
-            self.assertEqual(source.count(guard), 1)
-            source = source.replace(guard, "if false; then")
-        path = self.root / name
-        self.write_executable(path, source)
-        return path
-
-    def run_script(self, script, *args, **kwargs):
-        return subprocess.run(
-            ["bash", str(script), *map(str, args)],
-            check=False,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            **kwargs,
-        )
-
-    def run_driver(self, command, *args, verify=False, **kwargs):
-        options = ["--command", command, *args]
-        if not verify:
-            options.append("--no-verify")
-        return self.run_script(self.driver, *options, **kwargs)
-
-    def target(self, **overrides):
-        target = {
-            "name": "fixture-caddy",
-            "driver": "shell-command",
-            "command": 'cat "$KEY_FILE" "$CERT_FILE" > "$DELIVERED_FILE"',
-            "verify_host": "forgejo.example.invalid",
-            "timeout": 0,
-        }
-        target.update(overrides)
-        return target
-
-    def configure(self, *targets):
-        self.config_path.write_text(
-            json.dumps(
-                {
-                    "site_name": "offline-fixture",
-                    "cert_driver_dir": str(self.drivers),
-                    "log_file": str(self.root / "deploy.log"),
-                    "certs": {
-                        "test-lineage": {
-                            "domains": ["*.example.invalid"],
-                            "targets": list(targets),
-                            "healthchecks_url": "https://healthchecks.example.invalid/ping/test",
-                        }
-                    },
-                }
-            )
-        )
-        self.env["RENEWED_LINEAGE"] = str(self.lineage)
-        self.env["RENEWED_DOMAINS"] = "*.example.invalid"
-
-    def test_stream_paths_with_spaces_and_chdir(self):
-        inputs = self.root / "input files"
-        inputs.mkdir()
-        (inputs / "key").write_text("KEY\n")
-        (inputs / "chain").write_text("CHAIN\n")
-        working = self.root / "working directory"
-        working.mkdir()
-        self.env["EXPECTED_CWD"] = str(working)
-        self.env["EXPECTED_CERT_DIR"] = str(inputs)
-        result = self.run_driver(
-            'test "$PWD" = "$EXPECTED_CWD" && test "$CERT_DIR" = "$EXPECTED_CERT_DIR" && cat "$KEY_FILE" "$CERT_FILE" > "$DELIVERED_FILE"',
-            "--key-file",
-            "input files/key",
-            "--cert-file",
-            "input files/chain",
-            "--chdir",
-            working,
-            cwd=self.root,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.marker.read_text(), "KEY\nCHAIN\n")
-
-    def test_command_stdin_is_empty(self):
-        result = self.run_driver('test -z "$(cat)"', input="caller input")
-        self.assertEqual(result.returncode, 0, result.stdout)
-
-    def test_pipeline_failure_propagates(self):
-        result = self.run_driver("false | cat")
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_command_exit_status_propagates(self):
-        result = self.run_driver("exit 23")
-        self.assertEqual(result.returncode, 23)
-        self.assertFalse(self.verify_log.exists())
-
-    def test_timeout_stops_local_descendants(self):
-        result = self.run_driver(
-            '(sleep 2; touch "$DELIVERED_FILE") & wait', "--timeout", "1"
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("timed out", result.stdout)
-        time.sleep(1.2)
-        self.assertFalse(self.marker.exists())
-
-    def test_zero_timeout_is_supported(self):
-        result = self.run_driver("true", "--timeout", "0")
-        self.assertEqual(result.returncode, 0, result.stdout)
-
-    def test_invalid_options_fail_before_delivery(self):
-        for args in [
-            ("--timeout", "bad"),
-            ("--verify-port", "0"),
-            ("--verify-port", "65536"),
-            ("--key-file", "missing"),
-            ("--chdir", "missing"),
-            ("--timeout",),
-        ]:
-            with self.subTest(args=args):
-                result = self.run_script(
-                    self.driver,
-                    "--command",
-                    'touch "$DELIVERED_FILE"',
-                    "--no-verify",
-                    *args,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse(self.marker.exists())
-
-    def test_missing_verification_fails_before_delivery(self):
-        result = self.run_driver('touch "$DELIVERED_FILE"', verify=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.marker.exists())
-
-    def test_verification_failure_propagates(self):
-        self.env["VERIFY_MODE"] = "fail"
-        result = self.run_driver(
-            'touch "$DELIVERED_FILE"',
-            "--cert-file",
-            self.lineage / "cert.pem",
-            "--verify-host",
-            "forgejo.example.invalid",
-            verify=True,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(self.marker.exists())
-        self.assertIn(b"forgejo.example.invalid\0", self.verify_log.read_bytes())
-
-    def test_command_is_not_logged(self):
-        result = self.run_driver("true # DO_NOT_LOG_THIS_COMMAND")
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertNotIn("DO_NOT_LOG_THIS_COMMAND", result.stdout)
-
-    def test_dispatcher_delivers_then_verifies(self):
-        self.configure(self.target())
-        result = self.run_script(self.dispatcher)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.marker.read_text(), "TEST KEY\nTEST CHAIN\n")
-        args = self.verify_log.read_bytes().split(b"\0")
-        self.assertEqual(args.count(b"--host"), 2)  # before and after delivery
-        self.assertIn(b"15", args)
-        self.assertEqual(
-            self.hc_log.read_text().splitlines(),
-            [
-                "https://healthchecks.example.invalid/ping/test/start",
-                "https://healthchecks.example.invalid/ping/test",
-            ],
-        )
-
-    def test_dispatcher_skips_current_certificate(self):
-        self.env["VERIFY_MODE"] = "pass"
-        self.configure(self.target())
-        result = self.run_script(self.dispatcher)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("already serving current cert", result.stdout)
-        self.assertFalse(self.marker.exists())
-
-    def test_sample_ssh_command_streams_key_then_chain(self):
-        self.env["SSH_LOG"] = str(self.root / "ssh-args")
-        self.write_executable(
-            self.drivers / "ssh",
-            """#!/bin/bash
-printf '%s\\0' "$@" > "$SSH_LOG"
-cat > "$DELIVERED_FILE"
-""",
-        )
-        sample = json.loads((REPO / "deploy-config-SAMPLE.json").read_text())
-        targets = sample["certs"]["CHANGEME.example.com-wildcard"]["targets"]
-        target = next(t for t in targets if t["driver"] == "shell-command")
-        self.configure(target)
-        result = self.run_script(self.dispatcher)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.marker.read_text(), "TEST KEY\nTEST CHAIN\n")
-        args = (self.root / "ssh-args").read_bytes().split(b"\0")
-        self.assertIn(b"StrictHostKeyChecking=yes", args)
-        self.assertIn(b"BatchMode=yes", args)
-        self.assertEqual(args[-2], b"install")
-
-    def test_dispatcher_reports_failure_and_continues_other_targets(self):
-        self.configure(
-            self.target(command="exit 23"), self.target(name="second", verify=False)
-        )
-        result = self.run_script(self.dispatcher)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("1/2 succeeded", result.stdout)
-        self.assertTrue(self.marker.exists())
-        self.assertTrue(self.hc_log.read_text().endswith("/fail\n"))
-
-    def test_dispatcher_requires_verification_host(self):
-        self.configure(self.target(verify_host=""))
-        result = self.run_script(self.dispatcher)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.marker.exists())
-
-    def test_dispatcher_rejects_empty_command_even_if_cert_is_current(self):
-        self.env["VERIFY_MODE"] = "pass"
-        self.configure(self.target(command=""))
-        result = self.run_script(self.dispatcher)
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_dispatcher_explicit_bootstrap_skips_all_verification(self):
-        self.configure(self.target(verify=False, verify_host=""))
-        result = self.run_script(self.dispatcher)
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertTrue(self.marker.exists())
-        self.assertFalse(self.verify_log.exists())
-
-    def test_dispatcher_post_delivery_verification_failure(self):
-        self.env["VERIFY_MODE"] = "fail"
-        self.configure(self.target())
-        result = self.run_script(self.dispatcher)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(self.marker.exists())
-        self.assertTrue(self.hc_log.read_text().endswith("/fail\n"))
-
-    def test_verification_only_never_runs_delivery(self):
-        self.env["VERIFY_MODE"] = "pass"
-        self.configure(self.target(verify_port=8443, verify_cert_file="fullchain.pem"))
-        result = self.run_script(
-            self.sync, "--config", self.config_path, "-D", "--dry-run"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("1/1 passed", result.stdout)
-        self.assertFalse(self.marker.exists())
-        self.assertIn(b"8443\0", self.verify_log.read_bytes())
-        self.assertIn(
-            str(self.lineage / "fullchain.pem").encode(), self.verify_log.read_bytes()
-        )
-
-    def test_verification_only_missing_host_is_failure(self):
-        self.configure(self.target(verify_host=""))
-        result = self.run_script(
-            self.sync, "--config", self.config_path, "-D", "--dry-run"
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("0/1 passed", result.stdout)
-
-    def test_verification_only_explicit_skip(self):
-        self.configure(self.target(verify=False))
-        result = self.run_script(
-            self.sync, "--config", self.config_path, "-D", "--dry-run"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("1 skipped", result.stdout)
-        self.assertFalse(self.marker.exists())
-        self.assertFalse(self.verify_log.exists())
+    )
+    assert calls[0][0] == [
+        "docker",
+        "compose",
+        "up",
+        "-d",
+        "--force-recreate",
+        "--",
+        "caddy",
+        "other",
+    ]
+    assert calls[0][1]["cwd"] == str(tmp_path)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_failure_output_redacts_full_key_before_truncating(tmp_path):
+    key = tmp_path / "key"
+    key.write_text(
+        "-----BEGIN PRIVATE KEY-----\n"
+        + "SENSITIVEKEYDATA" * 200
+        + "\n-----END PRIVATE KEY-----\n"
+    )
+    result = invoke("cat " + shlex.quote(str(key)) + "; exit 1", "--no-verify")
+    assert result.returncode == 1
+    assert "SENSITIVEKEYDATA" not in result.stderr
+    assert "<private key redacted>" in result.stderr
+
+
+@pytest.mark.parametrize("signum", [2, 15])
+def test_signal_stops_child_group(tmp_path, signum):
+    started, late = tmp_path / "started", tmp_path / "late"
+    command = (
+        "touch "
+        + shlex.quote(str(started))
+        + "; (sleep 2; touch "
+        + shlex.quote(str(late))
+        + ") & wait"
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "certmgmt",
+            "driver",
+            "shell-command",
+            "--command",
+            command,
+            "--no-verify",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        limit = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < limit:
+            time.sleep(0.02)
+        assert started.exists()
+        process.send_signal(signum)
+        process.communicate(timeout=6)
+        assert process.returncode == 128 + signum
+        time.sleep(2.1)
+        assert not late.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()

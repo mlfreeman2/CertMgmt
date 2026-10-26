@@ -1,412 +1,258 @@
 # Certificate Deployment System
 
-Config-driven Let's Encrypt certificate management with automatic deployment to network devices.
+CertMgmt deploys certificates to nine kinds of devices and services. The issuer-side
+application is Python 3.14 (minimum 3.14.2), matching the Venstar Home Assistant
+components. Every driver is a standalone CLI: it accepts ordinary PEM paths and
+credentials, with no Certbot or site configuration required.
 
-> **Disclosure:** This project was developed with AI coding tools under my direction, originally [Claude Code](https://claude.com/claude-code), with subsequent contributions using Codex. Verification status is listed per driver in [Tested Hardware](#tested-hardware); offline tests are not live-device acceptance. Treat it like anything else you find on the internet: read it before pointing it at devices you care about.
+Certbot integration adds configuration-based fan-out, renewal hooks, and Cloudflare
+DNS-01 reconciliation. The remotely installed [Caddy receiver](caddy-cert-receive/README.md)
+and [PVE nginx helper](proxmox-nginx-reload/README.md) remain separate Bash programs.
+They do not need Python, and the issuer installer does not modify them.
 
-## How It Works
+## Install or upgrade the issuer
 
-- **certbot** fetches and renews certificates via Cloudflare DNS-01 challenge
-- On renewal, certbot runs **cert-dispatcher.sh**, which reads **deploy-config.json** to determine which devices need the new cert
-- The dispatcher invokes the appropriate **driver script** for each target device
-- Each driver verifies the cert is actually being served after deployment
+Use Linux with Python >=3.14.2 and venv/pip support. Certbot and its Cloudflare DNS
+plugin stay in their existing installation; CertMgmt invokes the `certbot` executable.
+Install Bash for `shell-command`, Docker Compose for that driver, OpenSSH for SSH
+commands, and nmap only if using inventory. CertMgmt's Python environment is separate
+from Certbot's environment. No Python upgrade is required on appliances or receivers.
 
-## File Layout
-
-```
-CertMgmt/
-  certbot-setup.sh                # One-time setup: installs certbot, copies config to /etc/letsencrypt
-  cert-dispatcher.sh              # Certbot deploy hook (copied into certbot's hooks dir by setup)
-  cert-sync.sh                    # Reconciles local certbot state to match config
-  scan-ssl-certs.sh               # Scan subnets, identify project-managed certs
-  scan-ssl-inventory.sh           # Scan subnets, report all certs found (no config needed)
-  deploy-config.json              # Site config (renamed from deploy-config-<site>.json)
-  cloudflare.ini                  # Cloudflare API token (renamed from cloudflare-<site>.ini)
-  drivers/
-    driver-idrac.sh               # Dell iDRAC (Redfish API)
-    driver-glinet-kvm.sh          # GL.iNet KVM (KVMD API)
-    driver-docker-compose.sh      # Docker compose service restart
-    driver-shell-command.sh      # Trusted local command, e.g. SSH delivery to Caddy
-    driver-truenas-scale.py       # TrueNAS Scale (WebSocket API)
-    driver-supermicro-ipmi.py     # Supermicro IPMI (X10/X11)
-    driver-reolink.py             # Reolink cameras (HTTP JSON API)
-    driver-brother-printer.py     # Brother printers (HTTP forms + PKCS#12)
-    driver-proxmox.py             # Proxmox VE (REST API, port 8006)
-    verify-deployed-cert.sh       # Shared post-deployment verification helper
-  caddy-cert-receive/            # Optional: target-side SSH receiver, sample config and setup guide
-  proxmox-nginx-reload/           # Optional: timer checks nginx's TLS cert on 443 and reloads when stale
-```
-
-After `certbot-setup.sh` runs, copies live in `/etc/letsencrypt/`:
-```
-/etc/letsencrypt/
-  cloudflare.ini
-  deploy-config.json
-  renewal-hooks/deploy/
-    cert-dispatcher.sh            # Only file here (old per-device scripts are removed)
-  cert-drivers/
-    (all driver scripts)
-  live/
-    (certbot-managed certificates)
-```
-
-## Setup: New Machine, No Existing Certs
-
-Use this when setting up a fresh machine or after a disaster recovery restore.
-
-### 1. Copy this directory to the machine
+Build from this checkout using the locked dependencies:
 
 ```bash
-# However you get it there (scp, rsync, restore from backup, etc.)
-# It should end up at your project's certificates path, e.g.:
-/home/myuser/my-project/certificates/
+python3.14 -m pip install uv==0.13.5
+uv sync --locked
+uv build
 ```
 
-### 2. Select the site config
-
-Delete the config and cloudflare files for the other sites, then rename your site's files:
+On a new issuer, create `/etc/letsencrypt/deploy-config.json` from
+[deploy-config-SAMPLE.json](deploy-config-SAMPLE.json), select the appropriate targets,
+and create `/etc/letsencrypt/cloudflare.ini` from `cloudflare-SAMPLE.ini`. Protect
+these files and credential files with mode 0600. Existing issuers keep their files.
+Install with the wheel's actual filename:
 
 ```bash
-cd /home/myuser/my-project/certificates
+sudo .venv/bin/python -m certmgmt install \
+  --wheel dist/certmgmt-0.1.0-py3-none-any.whl \
+  --python /path/to/python3.14 \
+  --config /etc/letsencrypt/deploy-config.json --dry-run
 
-# Example for the "mysite" site:
-rm deploy-config-site-b.json deploy-config-site-c.json
-rm cloudflare-site-b.ini cloudflare-site-c.ini
-
-mv deploy-config-mysite.json deploy-config.json
-mv cloudflare-mysite.ini cloudflare.ini
+# Apply the reviewed installation paths by removing --dry-run.
 ```
 
-### 3. Run setup
+The installer creates `/opt/certmgmt/versions/<wheel-hash>/`, installs runtime
+requirements with hashes, checks the environment, and switches `/opt/certmgmt/current`.
+The CLI is `/opt/certmgmt/bin/certmgmt`; add its directory to PATH if desired.
+It replaces only its recognized `cert-dispatcher.sh` deploy hook. Other hooks,
+site configuration, credentials, and the old `cert-drivers/` directory remain intact.
+Backups and receipts live outside Certbot's executable hook directory. Concurrent
+installation or rollback attempts are rejected.
+
+Use the installed CLI for the examples below. Installation does not issue certificates
+or push to devices. A normal Certbot renewal invokes the installed hook automatically.
 
 ```bash
-sudo ./certbot-setup.sh
+sudo /opt/certmgmt/bin/certmgmt sync --dry-run
+sudo /opt/certmgmt/bin/certmgmt sync --yes
+sudo /opt/certmgmt/bin/certmgmt verify
+sudo /opt/certmgmt/bin/certmgmt deploy --dry-run
+sudo /opt/certmgmt/bin/certmgmt deploy
 ```
 
-This installs certbot and dependencies, copies config/drivers/dispatcher into `/etc/letsencrypt/`, and removes any old per-device deploy hooks.
+For a custom Certbot directory, set `certbot_config_dir` in the site config and pass
+the matching `--hook-dir <directory>/renewal-hooks/deploy` when installing.
+`sync` requires that managed hook and passes the selected config to it explicitly.
 
-### 4. Preview what cert-sync will do
+Tooling rollback restores the previous environment and hook, including a legacy Bash
+hook if this was the first migration. It does not revert issued or deployed certificates:
 
 ```bash
-sudo ./cert-sync.sh --dry-run
+sudo /opt/certmgmt/bin/certmgmt rollback --dry-run
+sudo /opt/certmgmt/bin/certmgmt rollback
 ```
 
-This compares the config to certbot's current state. Since no certs exist yet, it will show that all configured certs need to be requested.
+Keep the old checkout and installed drivers until live acceptance is complete. For
+recovery, restore backed-up Certbot state, config, credentials and delivery SSH keys;
+install the desired CertMgmt wheel, preview `sync`, then explicitly deploy as needed.
 
-### 5. Fetch certificates
+## Standalone drivers and emergency pushes
+
+`certmgmt driver NAME --help` describes formats, defaults, restart behavior, and a
+complete example. `python -m certmgmt` is equivalent to the installed command.
+All drivers use `-h/--help`, `-H/--host`, `-c/--cert-file`, and `-k/--key-file` where
+applicable. Argument abbreviations are disabled. Direct driver invocation always
+performs delivery; the configured `deploy` command can skip current targets.
+
+Examples use certificates from `/certs`, which may be populated by any fetcher:
 
 ```bash
-sudo ./cert-sync.sh
+certmgmt driver idrac -H idrac.example.test -u root \
+  --password-file /run/secrets/idrac -c /certs/fullchain.pem -k /certs/privkey.pem
+
+certmgmt driver glinet-kvm -H kvm.example.test -u admin \
+  --password-file /run/secrets/kvm -c /certs/cert.pem -k /certs/privkey.pem
+
+certmgmt driver truenas-scale -H nas.example.test \
+  --api-key-file /run/secrets/nas --domain example.test \
+  -c /certs/fullchain.pem -k /certs/privkey.pem
+
+certmgmt driver supermicro-ipmi -H bmc.example.test -u ADMIN \
+  --password-file /run/secrets/bmc --model X11 \
+  -c /certs/fullchain.pem -k /certs/privkey.pem
+
+certmgmt driver reolink -H 192.0.2.21 -u admin \
+  --password-file /run/secrets/camera -c /certs/cert.pem -k /certs/privkey.pem
+
+certmgmt driver brother-printer -H printer.example.test -u admin \
+  --password-file /run/secrets/printer -c /certs/fullchain.pem -k /certs/privkey.pem
+
+certmgmt driver proxmox -H pve.example.test --node pve \
+  --api-token-file /run/secrets/pve -c /certs/fullchain.pem -k /certs/privkey.pem
+
+certmgmt driver docker-compose --compose-dir /srv/web --service caddy \
+  --verify-host web.example.test --verify-cert-file /certs/cert.pem
+
+certmgmt driver shell-command \
+  --command 'cat "$KEY_FILE" "$CERT_FILE" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.test install' \
+  -c /certs/fullchain.pem -k /certs/privkey.pem --verify-host web.example.test
 ```
 
-This requests all certificates from Let's Encrypt. Each cert request triggers the dispatcher, which deploys the cert to all configured targets.
+Credentials accept exactly one of `--password`, `--password-file`, or `--password-env`
+(the last names an environment variable). API drivers use the corresponding
+`--api-key*` or `--api-token*` options. Files avoid exposing credential values in process
+arguments. The Proxmox token file contains `user@realm!tokenid=secret`.
 
-### 6. Done
+Exit codes are **0** for success, **1** for an operation failure, **2** for invalid
+arguments/configuration, **130** for SIGINT, and **143** for SIGTERM. A failure after upload can leave
+the device changed. `--quiet` suppresses normal progress, while `--debug` retains
+credential redaction and does not enable HTTP/WebSocket payload logging.
 
-Certbot will auto-renew certificates every ~60 days and the dispatcher will redeploy them automatically.
+## Verification and timeouts
 
-## Setup: New Machine, Certs Already Present
+All drivers validate readable PEM input, matching key, validity dates, and applicable
+RSA/leaf restrictions before upload. Verification compares the SHA-256 fingerprint
+of the served leaf with the first certificate in the expected PEM file. It does not
+establish trust in the whole chain or detect a chain-only change.
 
-Use this when certbot already has certificates (e.g., you migrated `/etc/letsencrypt` from another machine, or you pulled certs down manually).
-
-### 1. Copy this directory to the machine
-
-Same as above.
-
-### 2. Select the site config
-
-Same as above -- delete the other sites' files, rename yours.
-
-### 3. Run setup
+`--verify-host`, `--verify-port`, `--verify-server-name` (SNI), and
+`--verify-cert-file` override the device/default certificate endpoint. Local shell
+and Compose drivers require verification host and expected certificate unless
+`--no-verify` is explicit. To connect by IP and send a separate SNI name:
 
 ```bash
-sudo ./certbot-setup.sh
+certmgmt verify -H 192.0.2.10 --port 443 --server-name web.example.test \
+  -c /certs/fullchain.pem
 ```
 
-This installs the dispatcher and drivers. It does **not** touch existing certificates in `/etc/letsencrypt/live/`.
+`--no-verify` controls the post-delivery fingerprint check. Management API trust is
+separate: the legacy bootstrap default does not validate appliance CA/hostname;
+`--api-tls-verify` enables it, and `--api-ca-file` enables it with a specified CA bundle.
 
-### 4. Preview cert-sync
+The whole deployment has a 900-second deadline, adjustable with
+`--operation-timeout`. Connection timeout defaults to 10 seconds; verification wait
+and retry defaults follow the device, with 30 seconds between probes. Reolink gets
+19 retries after the first probe. Shell/Compose commands also have `--timeout 120`;
+zero disables only that command deadline. Timeout or interruption terminates the
+local process group, including descendants. It cannot undo remote changes.
+
+## Configured deployment and Certbot
+
+`deploy-config.json` retains the existing `certs`/`targets` structure and driver names.
+Unknown fields are rejected; underscore-prefixed comments are allowed. `host` is the
+preferred connection field; legacy `ip` is accepted. `cert_driver_dir` is accepted for
+migration but unused: drivers now come from the installed package.
+
+Certificate filenames in targets are relative to the lineage; absolute paths and
+`..` traversal are rejected. They default to `fullchain.pem` and `privkey.pem`, except
+leaf-only devices use `cert.pem`. Credential files, CA bundles, working directories,
+and `certbot_config_dir` resolve relative to the config file. Direct driver paths
+resolve relative to the caller's directory before any `--chdir`.
+
+Targets accept credential fields such as `password_file` or `api_key_env`, common
+verification/timeouts, and their driver's options. `verify: false` explicitly disables
+fingerprint checks. `verify_ports` checks every listed port during deployment,
+already-current detection, and verification-only operation. Compose accepts
+`services` (legacy `service_name` also works).
 
 ```bash
-sudo ./cert-sync.sh --dry-run
+# Select a certificate and target; bypass current-leaf skipping for an emergency push.
+certmgmt deploy --config /etc/letsencrypt/deploy-config.json \
+  --cert-name example.test --target office-printer --force
+
+# Certificates obtained outside Certbot can use the configured targets too.
+certmgmt deploy --cert-name example.test --lineage /srv/cert-fetcher/example.test
+
+# These commands never upload or reload devices.
+certmgmt deploy --dry-run
+certmgmt verify --cert-name example.test --target office-printer
 ```
 
-cert-sync compares what certbot has to what the config says you should have:
+The entire selected deployment batch is validated before probes or mutations.
+A failed target is reported and remaining targets continue. `deploy` skips a target
+only when all configured endpoints already serve the expected leaf; use `--force`
+for chain-only changes. `verify` needs no device credential or private key and never
+runs delivery commands. `deploy --dry-run` validates and lists targets without network
+requests; it is distinct from `verify`, which connects to the devices.
 
-- **Matching certs**: reported as OK, no action needed
-- **Wrong key type/size**: will be revoked, deleted, and re-requested
-- **Wrong domains**: will be revoked, deleted, and re-requested
-- **Extra certs** (in certbot but not in config): reported but left alone
-- **Missing certs** (in config but not in certbot): will be requested
-
-### 5. Apply changes (if any)
+`sync` compares configured domains and key parameters with Certbot's local leaf
+certificates. It creates or updates changed lineages using `certbot certonly`, retaining
+the existing lineage on failed issuance. Missing config entries never trigger deletion.
+Normal expiry renewal remains the job of `certbot renew` and its existing timer.
+A sync update succeeds only if Certbot succeeds **and** the managed hook records a
+successful deployment. `--dry-run` previews; `--yes` applies without prompting.
+Revocation and deletion are explicit, separate operations:
 
 ```bash
-sudo ./cert-sync.sh
+certmgmt revoke --cert-name example.test --yes
+certmgmt delete --cert-name example.test --yes
 ```
 
-If everything matched, this is a no-op. If certs need to be fixed, it handles the revoke/delete/re-request cycle.
+These explicit operations use Certbot's default configuration directory; revoke does
+not implicitly delete the lineage. Back up Certbot state before deliberate removal.
 
-### 6. Deploy existing certs to devices
+Optional `healthchecks_url` on a certificate receives `/start` and aggregate success
+or `/fail` notifications during deployment. No notifications are sent for empty
+target groups, dry runs, or verification-only commands. Notification failures are
+nonfatal; deployment failures still determine the exit status. `log_file` enables a
+redacted file log in addition to console output.
 
-If certs were already present and matched the config, cert-sync didn't trigger the dispatcher (no renewal happened). To push the existing certs to all targets, manually invoke the dispatcher for each cert:
+## Remote helpers and device notes
 
-```bash
-# Find your cert names
-sudo certbot certificates
+The shell driver exports absolute `CERT_FILE`, `KEY_FILE`, and `CERT_DIR`. Its trusted
+command runs as the caller under Bash with `pipefail` and closed stdin; output is
+logged. The Caddy wire format remains **private key followed by full chain on stdin**.
+Enroll the receiver and pin its SSH host key using the
+[receiver instructions](caddy-cert-receive/README.md). The receiver validates and
+activates its versioned certificate slot, then forces a Caddy reload. For a first
+bootstrap delivery before the real Caddyfile is active, use `--no-verify` explicitly;
+enable verification for normal operation. No remote Python installation is involved.
 
-# Run the dispatcher for each cert
-sudo RENEWED_LINEAGE=/etc/letsencrypt/live/<cert-name> \
-     RENEWED_DOMAINS="<domains>" \
-     bash /etc/letsencrypt/renewal-hooks/deploy/cert-dispatcher.sh
-```
+The Proxmox driver uploads to pveproxy on port 8006. nginx on the PVE host is optional.
+If present, point it at `/etc/pve/local/pveproxy-ssl.pem` and use the unchanged
+[PVE helper/timer](proxmox-nginx-reload/README.md) to reload it. Set
+`"verify_ports": [8006, 443]` to require both listeners to serve the new leaf; this now
+also applies during deployment and current-certificate skipping.
 
-For example:
-```bash
-sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com-wildcard \
-     RENEWED_DOMAINS="*.example.com" \
-     bash /etc/letsencrypt/renewal-hooks/deploy/cert-dispatcher.sh
-```
+Reolink, Supermicro and Brother require RSA. Reolink and GL.iNet require a single
+leaf. Connect to Reolink by IP: long connection hostnames have caused failures on
+existing firmware. Some models take minutes to activate or need a reboot; the driver
+preserves the tested import protocol and does not add a CertificateClear operation.
+Supermicro reboots the BMC unless `--no-reboot`; that flag still requires the new
+certificate to become visible for verified success.
 
-## Adding a New Site
+Brother converts PEM to unencrypted PKCS#12 and keeps at most the first intermediate,
+preserving the device's two-certificate limit. Existing cleanup behavior is retained:
+remove older same-name certificates, or all older entries if firmware returns no name
+(with a warning). TrueNAS retains its managed `LetsEncrypt-<domain>-` ownership prefix
+for cleanup and its existing WebSocket API. Changing these device policies or adopting
+a newer TrueNAS protocol is separate work.
 
-1. Create a `deploy-config-<site>.json` with your site's targets (use an existing one as a template)
-2. Create a `cloudflare-<site>.ini` with the Cloudflare API token
-3. Copy the whole directory to the new machine
-4. Follow the "New Machine, No Existing Certs" steps above
+## Existing hardware record
 
-No code changes needed -- just a new config file.
-
-## Adding a New Device to a Site
-
-Add a new entry to the `targets` array for the appropriate cert in `deploy-config.json`, then re-run setup to push the updated config:
-
-```bash
-sudo ./certbot-setup.sh
-```
-
-The new target will be deployed to on the next cert renewal. To deploy immediately, manually invoke the dispatcher as shown above.
-
-## Running Drivers Manually
-
-Each driver accepts standard CLI arguments and can be run independently:
-
-```bash
-# Dell iDRAC
-./drivers/driver-idrac.sh -h 198.51.100.10 -u root -p PASSWORD \
-  -c /etc/letsencrypt/live/CERT/fullchain.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-
-# GL.iNet KVM
-./drivers/driver-glinet-kvm.sh -h 198.51.100.11 -u admin -p PASSWORD \
-  -c /etc/letsencrypt/live/CERT/cert.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-
-# Docker Compose
-./drivers/driver-docker-compose.sh -d /home/myuser/my-project -s caddy
-
-# TrueNAS Scale
-python3 ./drivers/driver-truenas-scale.py -H 198.51.100.12 -a API_KEY \
-  -D example.com \
-  -c /etc/letsencrypt/live/CERT/fullchain.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-
-# Supermicro IPMI
-python3 ./drivers/driver-supermicro-ipmi.py -H 198.51.100.13 -u USERNAME -p PASSWORD \
-  -c /etc/letsencrypt/live/CERT/fullchain.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem \
-  -m X10
-
-# Reolink Camera
-python3 ./drivers/driver-reolink.py -H 198.51.100.14 -u admin -p PASSWORD \
-  -c /etc/letsencrypt/live/CERT/cert.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-
-# Brother Printer
-python3 ./drivers/driver-brother-printer.py -H 198.51.100.15 -u admin -p PASSWORD \
-  -c /etc/letsencrypt/live/CERT/fullchain.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-
-# Proxmox VE
-python3 ./drivers/driver-proxmox.py -H 198.51.100.16 -a 'root@pam!tokenid=SECRET' \
-  -n pve \
-  -c /etc/letsencrypt/live/CERT/fullchain.pem \
-  -k /etc/letsencrypt/live/CERT/privkey.pem
-```
-
-All drivers support `--no-verify` to skip the post-deployment certificate check.
-
-## Scanning for SSL Certificates
-
-Two standalone scripts scan your network for TLS endpoints. Neither requires root, but nmap may be faster with it.
-
-**scan-ssl-certs.sh** — Identifies which certs on your network are managed by this project. Matches against deploy-config.json domains and certbot fingerprints.
-
-```bash
-./scan-ssl-certs.sh 192.168.1.0/24                    # scan a subnet
-./scan-ssl-certs.sh 192.168.1.0/24 10.0.0.0/24        # multiple subnets
-./scan-ssl-certs.sh -p 443,8443 -v 192.168.1.0/24     # custom ports, verbose
-```
-
-**scan-ssl-inventory.sh** — Reports every SSL cert found on a network. No config needed — useful for surveying an unknown network before writing a deploy-config.json.
-
-```bash
-./scan-ssl-inventory.sh 192.168.1.0/24                 # scan a subnet
-./scan-ssl-inventory.sh -n 192.168.1.0/24              # stdout only, no report file
-```
-
-Both require `nmap` and `openssl`. `scan-ssl-certs.sh` also requires `jq`.
-
-## Supported Driver Types
-
-| Config `driver` value | Script | Target |
-|---|---|---|
-| `idrac` | driver-idrac.sh | Dell iDRAC via Redfish API |
-| `glinet-kvm` | driver-glinet-kvm.sh | GL.iNet KVM via KVMD API |
-| `docker-compose` | driver-docker-compose.sh | Docker Compose service restart |
-| `shell-command` | driver-shell-command.sh | Configured Bash command followed by TLS verification |
-| `truenas-scale` | driver-truenas-scale.py | TrueNAS Scale via WebSocket API |
-| `supermicro-ipmi` | driver-supermicro-ipmi.py | Supermicro IPMI X10/X11 boards |
-| `reolink` | driver-reolink.py | Reolink cameras via HTTP JSON API |
-| `brother-printer` | driver-brother-printer.py | Brother network printers via HTTP forms |
-| `proxmox` | driver-proxmox.py | Proxmox VE via REST API (port 8006) |
-
-## Driver Notes
-
-### Shell command: certificate delivery to Caddy over SSH
-
-The `shell-command` driver runs a trusted command from the target config. It exports
-`CERT_FILE`, `KEY_FILE`, and `CERT_DIR`, with absolute paths, and optionally changes
-directory using `chdir`. Commands run as the caller (normally root), with stdin from
-`/dev/null` and Bash `pipefail` enabled. The command text is not logged, but its output
-is: keep credentials in protected files and never print keys or passwords.
-
-`timeout` is a whole number of seconds, defaults to 120, and accepts 0 to disable it.
-On timeout, the local command group is terminated, then killed after five seconds if
-necessary. Ending SSH is not a guarantee that a remote operation was rolled back;
-check the receiver before retrying a failed delivery.
-
-Add a target like this to the appropriate certificate's `targets` array **once the
-receiver is ready**:
-
-```json
-{
-  "name": "caddy-lxc",
-  "driver": "shell-command",
-  "command": "cat \"$KEY_FILE\" \"$CERT_FILE\" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.com install",
-  "timeout": 120,
-  "cert_file": "fullchain.pem",
-  "key_file": "privkey.pem",
-  "verify_host": "forgejo.apps.example.com",
-  "verify_port": 443,
-  "verify_cert_file": "cert.pem"
-}
-```
-
-The receiving command must accept **private key followed by full chain on stdin**,
-validate and install them, and reload Caddy with `--force`. It must return nonzero on
-failure. The sender then checks the certificate served over TLS. The receiver is
-installed separately on Caddy; this driver does not provision it. The maintained
-[receiver companion](caddy-cert-receive/README.md) includes the script, sample
-configuration, forced-command setup, and failure/recovery behavior. Its Caddyfile
-paths use `<slot>/current/fullchain.pem` and `<slot>/current/privkey.pem`.
-
-`verify_host` must be a name served by Caddy and covered by the certificate: the shared
-verifier uses it for both the connection and SNI. `cert_file` and `key_file` default to
-`fullchain.pem` and `privkey.pem`; `verify_cert_file` defaults to `cert.pem` in the
-dispatcher. These names are relative to the renewed lineage. Verification is required
-unless `"verify": false` is explicitly set. A missing hostname is a failure, including
-in verification-only mode.
-
-**Prepare the issuer before building Caddy.** For a new issuer, normal setup installs
-the driver and SSH client. To update an existing issuer without replacing its config,
-credentials, or other deploy hooks, run these from the updated checkout on that issuer:
-
-```bash
-sudo apt install -y openssh-client
-DRIVER_DIR=$(sudo jq -r '.cert_driver_dir // "/etc/letsencrypt/cert-drivers"' /etc/letsencrypt/deploy-config.json)
-sudo install -m 755 drivers/driver-shell-command.sh "$DRIVER_DIR/driver-shell-command.sh"
-sudo install -m 755 cert-dispatcher.sh /etc/letsencrypt/renewal-hooks/deploy/cert-dispatcher.sh
-```
-
-Use this checkout's updated `cert-sync.sh` for verification. Keep the live Caddy target
-out of the config until it can receive certificates. Create a dedicated delivery key
-on the issuer if it does not already exist:
-
-```bash
-sudo ssh-keygen -t ed25519 -N '' -f /etc/letsencrypt/caddy-deploy-key
-```
-
-Do not overwrite an existing key. Install its public half in the receiver's
-`authorized_keys`, restricted by source address and forced command. The private half
-stays on the issuer, mode 0600.
-
-**First delivery, after Caddy is built:**
-
-1. Compare Caddy's SSH host-key fingerprint with the one shown through the PVE console.
-   From the issuer, run `sudo ssh -i /etc/letsencrypt/caddy-deploy-key -o IdentitiesOnly=yes cert-receiver@caddy.example.com status`
-   and accept that verified key into root's `known_hosts`. An empty certificate slot
-   may make `status` return nonzero; host-key enrollment still succeeds.
-2. Leave Caddy's placeholder config running while sending the first certificate. Run
-   the driver directly with `--no-verify` for this one bootstrap delivery:
-
-   ```bash
-   DRIVER_DIR=$(sudo jq -r '.cert_driver_dir // "/etc/letsencrypt/cert-drivers"' /etc/letsencrypt/deploy-config.json)
-   sudo "$DRIVER_DIR/driver-shell-command.sh" \
-     --command 'cat "$KEY_FILE" "$CERT_FILE" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.com install' \
-     --cert-file /etc/letsencrypt/live/CERT_NAME/fullchain.pem \
-     --key-file /etc/letsencrypt/live/CERT_NAME/privkey.pem --no-verify
-   ```
-
-3. Install and validate the real Caddyfile, reload it, and point the site's DNS at Caddy.
-   Add the target above to the private site config, then run
-   `sudo install -m 600 deploy-config.json /etc/letsencrypt/deploy-config.json`.
-   Keep verification enabled for normal operation.
-4. Run `sudo ./cert-sync.sh -D --dry-run` from this checkout. It verifies served
-   certificates without invoking delivery commands. A later `sudo ./cert-sync.sh -D`
-   deploys current certificates without requesting renewal; targets already serving
-   the expected certificate are skipped.
-
-For a forced redelivery, invoke the driver directly with the same command and paths,
-replace `--no-verify` with `--verify-host forgejo.apps.example.com`, and keep the real
-Caddyfile active. Direct invocation always runs the command. After rebuilding Caddy,
-verify its new SSH fingerprint through PVE before removing the old entry with
-`sudo ssh-keygen -R caddy.example.com` and repeating enrollment and bootstrap.
-
-**Acceptance still needed on the real target:** complete bootstrap, deliver a changed
-certificate, confirm the served fingerprint changes without restarting Caddy, and
-confirm a rejected delivery is reported as failure. Local receiver tests cover
-installation failures, interrupted activation, concurrency, and reload retries;
-they use a Caddy stand-in and do not establish live Caddy acceptance.
-
-### Proxmox: nginx on the PVE host is optional
-
-The proxmox driver only talks to the Proxmox API on port 8006 -- it uploads the cert to `pveproxy`, which restarts itself. Nothing in this system requires nginx.
-
-That said, a common convenience is running nginx on the PVE host so you don't have to remember `:8006` -- listening on 443 with the same cert and redirecting to `https://<host>:8006`. If you do this:
-
-- Point nginx at `/etc/pve/local/pveproxy-ssl.pem` (the API-uploaded cert), **not** the self-signed `pve-ssl.pem` -- otherwise nginx keeps serving the old self-signed cert forever.
-- nginx does not notice when the driver uploads a new cert. Install the systemd timer and helper in [proxmox-nginx-reload/](proxmox-nginx-reload/). It checks the certificate actually served on 443, validates nginx's config, reloads if stale, and verifies the result. It replaces the earlier path watcher and cron fallback.
-- To have `cert-sync.sh -D --dry-run` verify nginx's copy too, set `"verify_ports": [8006, 443]` on the proxmox target in deploy-config.json. The default is `[8006]` only, so hosts without nginx verify cleanly.
-- The Proxmox driver's deployment verification and already-current skip check still cover 8006 only. `verify_ports` is used by the verification-only command above; deployment success alone does not prove nginx is current.
-
-### Reolink: connect by IP, keep hostnames short
-
-Reolink firmware is the quirkiest of the supported devices:
-
-- **~32-character hostname limit.** The camera's HTTP stack misbehaves (401 errors, odd API behavior) when the URL hostname exceeds roughly 32 characters -- [documented in the field for RTSP](https://github.com/blakeblackshear/frigate/discussions/11214) and observed here with the HTTPS API as well. Use the camera's IP in deploy-config.json (the `ip` field does this naturally) and keep the camera's own device name short. The certificate itself can still carry a long wildcard domain; only the connection URL matters.
-- **RSA only.** The cameras reject ECDSA certs -- set `"key_type": "rsa"` on the cert. The driver checks this before uploading.
-- **Single leaf cert only.** Upload `cert.pem`, never `fullchain.pem` -- the camera rejects chains. The driver checks this too.
-- **Slow to apply.** Cameras can take minutes to serve a newly uploaded cert, and [some models (e.g. E1 Pro) need a full reboot](https://gist.github.com/velzend/895c18d533b3992f3a0cc128f27c0894); the driver polls for up to ~10 minutes before declaring failure.
-- **Re-import quirks on some models.** Some firmware won't overwrite an existing cert without a `CertificateClear` call first (not needed on the hardware tested here; see the gist above if you hit it).
-
-### RSA-only devices
-
-Reolink cameras, Supermicro IPMI (X10/X11), and Brother printers all reject ECDSA certificates -- set `"key_type": "rsa"` on any cert that deploys to them. All three drivers check the cert before uploading and fail with a clear error rather than leaving the device in a half-configured state.
-
-## Tested Hardware
-
-Live-device results and offline-only coverage are distinguished below. Other models/firmware may work but haven't been verified — if a driver works on hardware not listed here, an issue or PR adding it is welcome.
+These are the previous implementation's recorded device results. The Python migration
+has offline protocol coverage; it still needs representative live upload, activation,
+and served-certificate acceptance before issuer cutover.
 
 | Driver | Device | HW Revision | Firmware Version | Notes |
 |---|---|---|---|---|
@@ -424,50 +270,71 @@ Live-device results and offline-only coverage are distinguished below. Other mod
 | `brother-printer` | HL-L3280CDW series | | MAIN 1.10 SUB3 2306291143 | RSA certs only (see Driver Notes) |
 | `proxmox` | n/a -- hypervisor OS | n/a | pve-manager 9.1.4 | Single node, with nginx on 443 serving the same cert (see Driver Notes) |
 
-## Notifications (Optional)
-
-The dispatcher can ping a [Healthchecks.io](https://healthchecks.io/) check on each cert deployment. Add a `healthchecks_url` to each cert in `deploy-config.json`:
-
-```json
-{
-  "certs": {
-    "example.com-wildcard": {
-      "healthchecks_url": "https://hc.example.com/ping/THIS-CERTS-UUID",
-      ...
-    }
-  }
-}
-```
-
-This gives you:
-- **Failure alerts** -- immediate notification when a deployment fails
-- **Heartbeat monitoring** -- if certbot stops renewing (cron broken, machine down), the missed ping triggers an alert before certs expire
-
-Use a dedicated check per cert. Certbot invokes the dispatcher once per renewed cert, so if certs shared a check the last cert to deploy would overwrite the check's status -- a cert that deploys cleanly could flip a check back to passing and mask another cert's failure.
-
-The field is optional. Certs without it send no pings, and certs with no deployment targets never ping their check.
-
-## Disaster Recovery
-
-1. Restore project from backup
-2. `sudo my-project/certificates/certbot-setup.sh`
-3. `sudo my-project/certificates/cert-sync.sh`
-4. Done -- renewals and deployments resume automatically
-
-## Offline Tests
+## Inventory
 
 ```bash
-python3 -m unittest discover -s tests -v
+certmgmt scan 192.0.2.0/24 --ports 443,8443,8006 --output inventory.jsonl
+certmgmt scan 192.0.2.0/24 --config /etc/letsencrypt/deploy-config.json
 ```
 
-Requires Python 3, Bash, OpenSSL, `jq`, and GNU coreutils. Fixtures redirect fixed installation
-paths into temporary directories and bypass the root check in a copied `cert-sync.sh`.
-They exercise delivery, pipeline and timeout failures, pre/post verification,
-dispatcher skip/failure reporting, and verification-only operation without root or
-external network calls. SSH and the TLS verifier are stand-ins in the sender tests;
-the nginx helper tests use a local TLS server and simulated service commands. Test
-success does not establish live Caddy, nginx, or PVE acceptance.
+nmap discovers open ports; Python reads TLS certificates. Reports are JSON Lines on
+stdout, also written to `--output` if supplied. Each row includes address, port, leaf
+fingerprint, names, issuer and expiry, or an error. Configured lineage fingerprints
+and domain patterns can annotate managed certificates. A domain-pattern match is an
+inventory hint, not proof of certificate identity. Failed scans or TLS probes produce
+a nonzero exit status. IPv4 and IPv6 CIDRs are supported.
+
+## Compatibility and source layout
+
+The old issuer `.sh` and driver `.py` filenames are thin checkout launchers. Keep them
+with the checkout; copying individual launchers to the old driver directory will not
+install the package. Shell launchers use `CERTMGMT_PYTHON` if set, otherwise `python3`
+from PATH. Activate the Python 3.14 environment when using these launchers.
+
+- Legacy iDRAC/GL.iNet `-h HOST` is translated to `--host`; bare `-h` now shows help.
+- `cert-sync.sh -D` maps to `deploy`; `-D --dry-run` retains verification-only behavior.
+- `certbot-setup.sh` now needs explicit wheel/config options and preserves existing
+  files. It no longer installs OS packages or overwrites credentials.
+- `verify-deployed-cert.sh` maps its short options to `verify`; standalone verification
+  now defaults to an immediate single probe. Use explicit wait/retry flags if needed.
+- Scanner names remain launchers, but output is now JSONL, stdout-only by default.
+- New failures are explicit: missing verification inputs, invalid certificate/key
+  pairs, malformed config, and activation failures do not report success.
+
+Implementation lives in `certmgmt/`: `cli`/`registry` define the public interface,
+`drivers/` contains protocol adapters, `certificates`/`runtime` supply shared services,
+and `config`, `orchestration`, `reconcile`, `installer`, and `scanner` implement commands.
+The two remote-helper directories remain independently installable.
+
+## Development and offline verification
+
+```bash
+uv sync --locked
+uv run --no-sync ruff check certmgmt tests
+uv run --no-sync ruff format --check certmgmt tests
+uv run --no-sync pytest -q
+uv build
+uv pip check
+```
+
+Tests need Bash, OpenSSL, jq and GNU coreutils, but no production credentials or devices.
+They cover CLI launchers, protocol fixtures, real local TLS, cancellation, aggregate
+failures, Certbot outcomes, installation/rollback, and the existing remote helpers.
+The helper fixtures use isolated temporary paths and service stand-ins.
+
+`uv.lock` locks developer/runtime dependencies. When changing dependencies, regenerate
+and commit the hashed runtime export packaged into the wheel:
+
+```bash
+uv lock
+uv export --frozen --no-dev --no-emit-project --format requirements-txt \
+  --output-file certmgmt/runtime-requirements.txt
+```
+
+CI uses Python 3.14 and verifies that export matches the lock. The
+[migration plan](docs/plans/python-migration.md) records verification and the remaining
+live acceptance boundary.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT — see [LICENSE](LICENSE).

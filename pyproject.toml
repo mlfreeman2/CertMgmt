@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "certmgmt"
+version = "0.1.0"
+description = "Certificate deployment drivers and Certbot orchestration"
+readme = "README.md"
+requires-python = ">=3.14.2"
+license = "MIT"
+dependencies = ["requests>=2.32", "websockets>=15", "cryptography>=46", "lxml>=6"]
+
+[project.scripts]
+certmgmt = "certmgmt.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9", "ruff>=0.14", "build>=1.3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["certmgmt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+# Preserve the remote-helper tests' standalone compatibility with system Python.
+exclude = ["tests/test_nginx_cert_reload.py", "tests/test_caddy_cert_receive.py"]

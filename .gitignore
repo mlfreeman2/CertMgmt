@@ -12,5 +12,11 @@ cloudflare-*.ini
 ssl-scan-*.txt
 ssl-inventory-*.txt
 .env
+/secrets/
 .DS_Store
 __pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
