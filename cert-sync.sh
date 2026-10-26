@@ -127,7 +127,9 @@ if $DEPLOY; then
             ;;
           proxmox)
             VERIFY_HOST=$(echo "$TARGET" | jq -r '.ip')
-            VERIFY_PORTS="8006 443"
+            # pveproxy is always on 8006; verify_ports adds more (e.g. 443
+            # when an optional nginx on the PVE host serves the same cert)
+            VERIFY_PORTS=$(echo "$TARGET" | jq -r '.verify_ports // [8006] | join(" ")')
             VERIFY_CERT_REL=$(echo "$TARGET" | jq -r '.cert_file // "fullchain.pem"')
             ;;
           docker-compose)

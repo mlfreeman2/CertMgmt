@@ -6,7 +6,22 @@
       "version": "lts"
     }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq curl openssl shellcheck ncat nmap certbot python3-certbot-dns-cloudflare httpie && pip install --user requests websockets cryptography lxml && npm install -g @anthropic-ai/claude-code",
+  "postCreateCommand": {
+    "system-packages": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq curl openssl shellcheck ncat nmap certbot python3-certbot-dns-cloudflare httpie",
+    "python-deps": "pip install --user -r ${containerWorkspaceFolder}/requirements.txt ruff",
+    "claude-code": "npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code",
+    "claude-dir": "sudo chown -R vscode:vscode /home/vscode/.claude"
+  },
+  "mounts": [
+    // Claude Code auth + config + memory, SHARED across all local devcontainers
+    // (one login everywhere; CLAUDE_CONFIG_DIR below must point at the target).
+    // Create the host folder before first use: a bind mount fails if its source does not exist.
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude-devcontainers,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.codex-devcontainers,target=/home/vscode/.codex,type=bind,consistency=cached",
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
@@ -18,7 +33,8 @@
         "rangav.vscode-thunder-client",
         "zainchen.json",
         "redhat.vscode-yaml",
-        "Anthropic.claude-code"
+        "Anthropic.claude-code",
+        "openai.chatgpt"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/bin/python",
@@ -30,6 +46,7 @@
             "source.organizeImports.ruff": "explicit"
           }
         },
+        "ruff.importStrategy": "fromEnvironment",
         "shellcheck.enable": true,
         "shellcheck.executablePath": "shellcheck"
       }

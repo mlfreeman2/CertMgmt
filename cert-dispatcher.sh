@@ -11,7 +11,6 @@ set -u
 CONFIG_FILE="/etc/letsencrypt/deploy-config.json"
 LOGFILE=$(jq -r '.log_file // "/var/log/cert-deploy.log"' "$CONFIG_FILE" 2>/dev/null || echo "/var/log/cert-deploy.log")
 DRIVER_DIR=$(jq -r '.cert_driver_dir // "/etc/letsencrypt/cert-drivers"' "$CONFIG_FILE" 2>/dev/null || echo "/etc/letsencrypt/cert-drivers")
-HC_URL=$(jq -r '.healthchecks_url // empty' "$CONFIG_FILE" 2>/dev/null)
 
 # --- Healthchecks.io ping helper ---
 # Pings are best-effort: failures are logged but never affect the exit code.
@@ -96,11 +95,15 @@ if [ -z "${RENEWED_LINEAGE:-}" ]; then
 fi
 
 CERT_NAME=$(basename "$RENEWED_LINEAGE")
+
+# Healthchecks URL is strictly per-cert. A shared check would let one cert's
+# success mask another cert's failure when several lineages renew in the same
+# certbot run — certs without their own URL send no pings at all.
+HC_URL=$(jq -r ".certs[\"$CERT_NAME\"].healthchecks_url // empty" "$CONFIG_FILE" 2>/dev/null)
+
 log "=== Certificate renewed: $CERT_NAME ==="
 log "Lineage: $RENEWED_LINEAGE"
 log "Domains: ${RENEWED_DOMAINS:-}"
-
-ping_healthchecks "/start"
 
 # --- Look up targets in config ---
 TARGETS=$(jq -c ".certs[\"$CERT_NAME\"].targets // empty" "$CONFIG_FILE")
@@ -109,6 +112,10 @@ if [ -z "$TARGETS" ] || [ "$TARGETS" = "null" ] || [ "$TARGETS" = "[]" ]; then
   log "No deployment targets configured for cert '$CERT_NAME'. Nothing to do."
   exit 0
 fi
+
+# Ping /start only once we know there is work to do — a cert with no targets
+# must not leave its check dangling in the "started" state.
+ping_healthchecks "/start"
 
 # --- Track overall success ---
 TOTAL=0
@@ -228,7 +235,8 @@ while read -r TARGET; do
 
     reolink)
       IP=$(target_field ip)
-      CERT_FILE=$(target_cert_path "fullchain.pem")
+      # Reolink rejects cert chains — default to the leaf cert
+      CERT_FILE=$(target_cert_path "cert.pem")
       KEY_FILE=$(target_key_path)
       check_skip_deployed "$IP" "443" "$CERT_FILE" && continue
       run_driver python3 "$DRIVER_DIR/driver-reolink.py" \
