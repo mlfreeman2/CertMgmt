@@ -53,7 +53,7 @@ echo "Source directory: $SCRIPT_DIR"
 echo ""
 echo "Installing packages..."
 apt update
-apt install -y certbot python3-certbot-dns-cloudflare jq curl \
+apt install -y certbot python3-certbot-dns-cloudflare jq curl openssh-client \
   python3-requests python3-lxml python3-websockets python3-cryptography
 
 # --- Copy cloudflare credentials ---

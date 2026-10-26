@@ -1,6 +1,9 @@
 [Unit]
-Description=Reload nginx after pveproxy cert change
+Description=Check nginx's served certificate and reload it when stale
+After=pve-cluster.service nginx.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nginx -s reload
+EnvironmentFile=/etc/default/pveproxy-cert-reload
+ExecStart=/usr/local/sbin/pveproxy-cert-reload
+TimeoutStartSec=90s

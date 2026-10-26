@@ -12,7 +12,8 @@
 #   2. To share the cert with nginx on the same host, point nginx at:
 #        ssl_certificate     /etc/pve/local/pveproxy-ssl.pem;
 #        ssl_certificate_key /etc/pve/local/pveproxy-ssl.key;
-#      and create a systemd .path unit to reload nginx when the cert changes.
+#      and install the timer/check helper in proxmox-nginx-reload/ to reload nginx
+#      when its served certificate is stale, then verify the result on port 443.
 #
 # Requires: pip install requests
 #

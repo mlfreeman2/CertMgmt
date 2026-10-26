@@ -132,13 +132,19 @@ if $DEPLOY; then
             VERIFY_PORTS=$(echo "$TARGET" | jq -r '.verify_ports // [8006] | join(" ")')
             VERIFY_CERT_REL=$(echo "$TARGET" | jq -r '.cert_file // "fullchain.pem"')
             ;;
-          docker-compose)
+          docker-compose|shell-command)
             VERIFY_HOST=$(echo "$TARGET" | jq -r '.verify_host // empty')
             VERIFY_PORTS=$(echo "$TARGET" | jq -r '.verify_port // "443"')
             VERIFY_CERT_REL=$(echo "$TARGET" | jq -r '.verify_cert_file // "cert.pem"')
             ;;
         esac
         if [ -z "$VERIFY_HOST" ]; then
+          if [ "$DRIVER_TYPE" = "shell-command" ]; then
+            echo "  FAIL $TARGET_NAME: shell-command requires verify_host"
+            VTOTAL=$((VTOTAL + 1))
+            VFAILED=$((VFAILED + 1))
+            continue
+          fi
           echo "  SKIP $TARGET_NAME: no host to verify against"
           VSKIPPED=$((VSKIPPED + 1))
           continue

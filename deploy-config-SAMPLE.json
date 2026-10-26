@@ -99,6 +99,19 @@
           "services": ["caddy"],
           "verify_host": "127.0.0.1",
           "verify_cert_file": "cert.pem"
+        },
+
+        {
+          "_comment": "Caddy over SSH: key then full chain on stdin; receiver installs and reloads, issuer verifies TLS by hostname. Enroll the receiver and pin its SSH host key first.",
+          "name": "my-caddy-lxc",
+          "driver": "shell-command",
+          "command": "cat \"$KEY_FILE\" \"$CERT_FILE\" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.com install",
+          "timeout": 120,
+          "cert_file": "fullchain.pem",
+          "key_file": "privkey.pem",
+          "verify_host": "forgejo.CHANGEME.example.com",
+          "verify_port": 443,
+          "verify_cert_file": "cert.pem"
         }
 
       ]
