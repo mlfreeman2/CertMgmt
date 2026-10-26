@@ -1,3 +1,4 @@
+# Legacy unit, superseded by pveproxy-cert-reload.timer. Disable it when migrating.
 [Unit]
 Description=Watch pveproxy TLS cert for changes and reload nginx
 

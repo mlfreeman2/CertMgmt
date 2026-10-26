@@ -29,7 +29,9 @@ All drivers support `--no-verify` to skip post-deployment certificate check.
 - **Bash**: `shellcheck <script>` (auto-runs in VS Code)
 - **Python**: `ruff check` / `ruff format` (auto-format on save in VS Code)
 
-No formal test suite exists. Verification is done via `--dry-run` mode and post-deployment cert checks.
+Run `python3 -m unittest discover -s tests -v` for the shell-command driver/integration, Caddy receiver, and nginx certificate helper. These use isolated fixtures, real PEM validation, injected receiver failures, and a local TLS server, not live devices. Live verification uses `--dry-run` mode and post-deployment cert checks.
+
+`caddy-cert-receive/` is installed separately on the target host. Its versioned certificate directories are activated through a single `current` symlink; Caddyfile paths must include `/current/`. The issuer installer only copies `drivers/`.
 
 ## Architecture
 
@@ -59,6 +61,7 @@ Drivers live in `drivers/` and follow a common interface:
 | `idrac` | driver-idrac.sh | Redfish REST API |
 | `glinet-kvm` | driver-glinet-kvm.sh | KVMD API |
 | `docker-compose` | driver-docker-compose.sh | Local service restart |
+| `shell-command` | driver-shell-command.sh | Trusted local command, e.g. SSH certificate delivery |
 | `truenas-scale` | driver-truenas-scale.py | WebSocket API |
 | `supermicro-ipmi` | driver-supermicro-ipmi.py | HTTP + CSRF tokens |
 | `reolink` | driver-reolink.py | HTTP JSON API |
@@ -78,4 +81,4 @@ Drivers live in `drivers/` and follow a common interface:
 - Python drivers use `argparse` for CLI args and `requests`/`websockets` for network calls
 - Python dependencies: requests, websockets, cryptography, lxml
 - Logging goes to the path specified by `log_file` in deploy-config.json (default: `/var/log/cert-deploy.log`)
-- Adding a new device type only requires writing a new driver script and adding a case to the dispatcher — no core changes needed
+- Adding a new device type requires its driver, dispatcher routing, verification-only routing in cert-sync, and a sample config entry

@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically check the certificate nginx serves for the PVE redirect
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=1min
+AccuracySec=1s
+Unit=pveproxy-cert-reload.service
+
+[Install]
+WantedBy=timers.target

@@ -195,6 +195,32 @@ while read -r TARGET; do
         --compose-dir "$COMPOSE_DIR" "${SERVICE_ARGS[@]}" "${DC_VERIFY_ARGS[@]}"
       ;;
 
+    shell-command)
+      COMMAND=$(target_field command)
+      VERIFY_HOST=$(target_field verify_host)
+      VERIFY_PORT=$(target_field verify_port "443")
+      VERIFY_CERT_FILE="$RENEWED_LINEAGE/$(target_field verify_cert_file "cert.pem")"
+      if [ -z "$COMMAND" ]; then
+        log "ERROR: target '$TARGET_NAME' has no shell command"
+        RESULT=1
+      elif [ ${#VERIFY_ARGS[@]} -eq 0 ] && [ -z "$VERIFY_HOST" ]; then
+        log "ERROR: target '$TARGET_NAME' needs verify_host (or explicit verify: false)"
+        RESULT=1
+      else
+        SC_ARGS=(--command "$COMMAND" --cert-file "$(target_cert_path)" --key-file "$(target_key_path)")
+        CHDIR=$(target_field chdir)
+        [ -z "$CHDIR" ] || SC_ARGS+=(--chdir "$CHDIR")
+        SC_ARGS+=(--timeout "$(target_field timeout "120")")
+        if [ ${#VERIFY_ARGS[@]} -eq 0 ]; then
+          check_skip_deployed "$VERIFY_HOST" "$VERIFY_PORT" "$VERIFY_CERT_FILE" && continue
+          SC_ARGS+=(--verify-host "$VERIFY_HOST" --verify-port "$VERIFY_PORT" --verify-cert-file "$VERIFY_CERT_FILE")
+        else
+          SC_ARGS+=("${VERIFY_ARGS[@]}")
+        fi
+        run_driver "$DRIVER_DIR/driver-shell-command.sh" "${SC_ARGS[@]}"
+      fi
+      ;;
+
     truenas-scale)
       IP=$(target_field ip)
       CERT_FILE=$(target_cert_path "fullchain.pem")

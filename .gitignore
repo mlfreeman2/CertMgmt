@@ -13,3 +13,4 @@ ssl-scan-*.txt
 ssl-inventory-*.txt
 .env
 .DS_Store
+__pycache__/

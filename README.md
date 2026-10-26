@@ -2,7 +2,7 @@
 
 Config-driven Let's Encrypt certificate management with automatic deployment to network devices.
 
-> **Disclosure:** All code in this repository was written by [Claude Code](https://claude.com/claude-code), Anthropic's AI coding tool, working under my direction. I designed the system, reviewed the code, and tested every driver against real hardware on my own network (see [Tested Hardware](#tested-hardware)). That said, treat it like anything else you find on the internet: read it before pointing it at devices you care about.
+> **Disclosure:** This project was developed with AI coding tools under my direction, originally [Claude Code](https://claude.com/claude-code), with subsequent contributions using Codex. Verification status is listed per driver in [Tested Hardware](#tested-hardware); offline tests are not live-device acceptance. Treat it like anything else you find on the internet: read it before pointing it at devices you care about.
 
 ## How It Works
 
@@ -26,13 +26,15 @@ CertMgmt/
     driver-idrac.sh               # Dell iDRAC (Redfish API)
     driver-glinet-kvm.sh          # GL.iNet KVM (KVMD API)
     driver-docker-compose.sh      # Docker compose service restart
+    driver-shell-command.sh      # Trusted local command, e.g. SSH delivery to Caddy
     driver-truenas-scale.py       # TrueNAS Scale (WebSocket API)
     driver-supermicro-ipmi.py     # Supermicro IPMI (X10/X11)
     driver-reolink.py             # Reolink cameras (HTTP JSON API)
     driver-brother-printer.py     # Brother printers (HTTP forms + PKCS#12)
     driver-proxmox.py             # Proxmox VE (REST API, port 8006)
     verify-deployed-cert.sh       # Shared post-deployment verification helper
-  proxmox-nginx-reload/           # Optional: systemd units to reload nginx on a PVE host when the cert changes
+  caddy-cert-receive/            # Optional: target-side SSH receiver, sample config and setup guide
+  proxmox-nginx-reload/           # Optional: timer checks nginx's TLS cert on 443 and reloads when stale
 ```
 
 After `certbot-setup.sh` runs, copies live in `/etc/letsencrypt/`:
@@ -262,6 +264,7 @@ Both require `nmap` and `openssl`. `scan-ssl-certs.sh` also requires `jq`.
 | `idrac` | driver-idrac.sh | Dell iDRAC via Redfish API |
 | `glinet-kvm` | driver-glinet-kvm.sh | GL.iNet KVM via KVMD API |
 | `docker-compose` | driver-docker-compose.sh | Docker Compose service restart |
+| `shell-command` | driver-shell-command.sh | Configured Bash command followed by TLS verification |
 | `truenas-scale` | driver-truenas-scale.py | TrueNAS Scale via WebSocket API |
 | `supermicro-ipmi` | driver-supermicro-ipmi.py | Supermicro IPMI X10/X11 boards |
 | `reolink` | driver-reolink.py | Reolink cameras via HTTP JSON API |
@@ -270,6 +273,112 @@ Both require `nmap` and `openssl`. `scan-ssl-certs.sh` also requires `jq`.
 
 ## Driver Notes
 
+### Shell command: certificate delivery to Caddy over SSH
+
+The `shell-command` driver runs a trusted command from the target config. It exports
+`CERT_FILE`, `KEY_FILE`, and `CERT_DIR`, with absolute paths, and optionally changes
+directory using `chdir`. Commands run as the caller (normally root), with stdin from
+`/dev/null` and Bash `pipefail` enabled. The command text is not logged, but its output
+is: keep credentials in protected files and never print keys or passwords.
+
+`timeout` is a whole number of seconds, defaults to 120, and accepts 0 to disable it.
+On timeout, the local command group is terminated, then killed after five seconds if
+necessary. Ending SSH is not a guarantee that a remote operation was rolled back;
+check the receiver before retrying a failed delivery.
+
+Add a target like this to the appropriate certificate's `targets` array **once the
+receiver is ready**:
+
+```json
+{
+  "name": "caddy-lxc",
+  "driver": "shell-command",
+  "command": "cat \"$KEY_FILE\" \"$CERT_FILE\" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.com install",
+  "timeout": 120,
+  "cert_file": "fullchain.pem",
+  "key_file": "privkey.pem",
+  "verify_host": "forgejo.apps.example.com",
+  "verify_port": 443,
+  "verify_cert_file": "cert.pem"
+}
+```
+
+The receiving command must accept **private key followed by full chain on stdin**,
+validate and install them, and reload Caddy with `--force`. It must return nonzero on
+failure. The sender then checks the certificate served over TLS. The receiver is
+installed separately on Caddy; this driver does not provision it. The maintained
+[receiver companion](caddy-cert-receive/README.md) includes the script, sample
+configuration, forced-command setup, and failure/recovery behavior. Its Caddyfile
+paths use `<slot>/current/fullchain.pem` and `<slot>/current/privkey.pem`.
+
+`verify_host` must be a name served by Caddy and covered by the certificate: the shared
+verifier uses it for both the connection and SNI. `cert_file` and `key_file` default to
+`fullchain.pem` and `privkey.pem`; `verify_cert_file` defaults to `cert.pem` in the
+dispatcher. These names are relative to the renewed lineage. Verification is required
+unless `"verify": false` is explicitly set. A missing hostname is a failure, including
+in verification-only mode.
+
+**Prepare the issuer before building Caddy.** For a new issuer, normal setup installs
+the driver and SSH client. To update an existing issuer without replacing its config,
+credentials, or other deploy hooks, run these from the updated checkout on that issuer:
+
+```bash
+sudo apt install -y openssh-client
+DRIVER_DIR=$(sudo jq -r '.cert_driver_dir // "/etc/letsencrypt/cert-drivers"' /etc/letsencrypt/deploy-config.json)
+sudo install -m 755 drivers/driver-shell-command.sh "$DRIVER_DIR/driver-shell-command.sh"
+sudo install -m 755 cert-dispatcher.sh /etc/letsencrypt/renewal-hooks/deploy/cert-dispatcher.sh
+```
+
+Use this checkout's updated `cert-sync.sh` for verification. Keep the live Caddy target
+out of the config until it can receive certificates. Create a dedicated delivery key
+on the issuer if it does not already exist:
+
+```bash
+sudo ssh-keygen -t ed25519 -N '' -f /etc/letsencrypt/caddy-deploy-key
+```
+
+Do not overwrite an existing key. Install its public half in the receiver's
+`authorized_keys`, restricted by source address and forced command. The private half
+stays on the issuer, mode 0600.
+
+**First delivery, after Caddy is built:**
+
+1. Compare Caddy's SSH host-key fingerprint with the one shown through the PVE console.
+   From the issuer, run `sudo ssh -i /etc/letsencrypt/caddy-deploy-key -o IdentitiesOnly=yes cert-receiver@caddy.example.com status`
+   and accept that verified key into root's `known_hosts`. An empty certificate slot
+   may make `status` return nonzero; host-key enrollment still succeeds.
+2. Leave Caddy's placeholder config running while sending the first certificate. Run
+   the driver directly with `--no-verify` for this one bootstrap delivery:
+
+   ```bash
+   DRIVER_DIR=$(sudo jq -r '.cert_driver_dir // "/etc/letsencrypt/cert-drivers"' /etc/letsencrypt/deploy-config.json)
+   sudo "$DRIVER_DIR/driver-shell-command.sh" \
+     --command 'cat "$KEY_FILE" "$CERT_FILE" | ssh -i /etc/letsencrypt/caddy-deploy-key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 cert-receiver@caddy.example.com install' \
+     --cert-file /etc/letsencrypt/live/CERT_NAME/fullchain.pem \
+     --key-file /etc/letsencrypt/live/CERT_NAME/privkey.pem --no-verify
+   ```
+
+3. Install and validate the real Caddyfile, reload it, and point the site's DNS at Caddy.
+   Add the target above to the private site config, then run
+   `sudo install -m 600 deploy-config.json /etc/letsencrypt/deploy-config.json`.
+   Keep verification enabled for normal operation.
+4. Run `sudo ./cert-sync.sh -D --dry-run` from this checkout. It verifies served
+   certificates without invoking delivery commands. A later `sudo ./cert-sync.sh -D`
+   deploys current certificates without requesting renewal; targets already serving
+   the expected certificate are skipped.
+
+For a forced redelivery, invoke the driver directly with the same command and paths,
+replace `--no-verify` with `--verify-host forgejo.apps.example.com`, and keep the real
+Caddyfile active. Direct invocation always runs the command. After rebuilding Caddy,
+verify its new SSH fingerprint through PVE before removing the old entry with
+`sudo ssh-keygen -R caddy.example.com` and repeating enrollment and bootstrap.
+
+**Acceptance still needed on the real target:** complete bootstrap, deliver a changed
+certificate, confirm the served fingerprint changes without restarting Caddy, and
+confirm a rejected delivery is reported as failure. Local receiver tests cover
+installation failures, interrupted activation, concurrency, and reload retries;
+they use a Caddy stand-in and do not establish live Caddy acceptance.
+
 ### Proxmox: nginx on the PVE host is optional
 
 The proxmox driver only talks to the Proxmox API on port 8006 -- it uploads the cert to `pveproxy`, which restarts itself. Nothing in this system requires nginx.
@@ -277,8 +386,9 @@ The proxmox driver only talks to the Proxmox API on port 8006 -- it uploads the 
 That said, a common convenience is running nginx on the PVE host so you don't have to remember `:8006` -- listening on 443 with the same cert and redirecting to `https://<host>:8006`. If you do this:
 
 - Point nginx at `/etc/pve/local/pveproxy-ssl.pem` (the API-uploaded cert), **not** the self-signed `pve-ssl.pem` -- otherwise nginx keeps serving the old self-signed cert forever.
-- nginx does not notice when the driver uploads a new cert. Install the systemd path unit in [proxmox-nginx-reload/](proxmox-nginx-reload/) to reload nginx automatically on cert changes.
+- nginx does not notice when the driver uploads a new cert. Install the systemd timer and helper in [proxmox-nginx-reload/](proxmox-nginx-reload/). It checks the certificate actually served on 443, validates nginx's config, reloads if stale, and verifies the result. It replaces the earlier path watcher and cron fallback.
 - To have `cert-sync.sh -D --dry-run` verify nginx's copy too, set `"verify_ports": [8006, 443]` on the proxmox target in deploy-config.json. The default is `[8006]` only, so hosts without nginx verify cleanly.
+- The Proxmox driver's deployment verification and already-current skip check still cover 8006 only. `verify_ports` is used by the verification-only command above; deployment success alone does not prove nginx is current.
 
 ### Reolink: connect by IP, keep hostnames short
 
@@ -296,13 +406,14 @@ Reolink cameras, Supermicro IPMI (X10/X11), and Brother printers all reject ECDS
 
 ## Tested Hardware
 
-Every driver has been exercised against the devices below. Other models/firmware may work but haven't been verified — if a driver works on hardware not listed here, an issue or PR adding it is welcome.
+Live-device results and offline-only coverage are distinguished below. Other models/firmware may work but haven't been verified — if a driver works on hardware not listed here, an issue or PR adding it is welcome.
 
 | Driver | Device | HW Revision | Firmware Version | Notes |
 |---|---|---|---|---|
 | `idrac` | PowerEdge T340 w/ 14G Monolithic | 0.01 | 7.00.00.174 | Tested with an Enterprise license; unverified whether Express/Basic suffices |
 | `glinet-kvm` | GL-RM1PE | n/a | 1.8.0 Release 1 | 3 of them, at 3 locations |
 | `docker-compose` | n/a -- local services | n/a | n/a | Restarts one or more containers. Requires /etc/letsencrypt mapped in to target containers. Only tested with caddy. |
+| `shell-command` | Offline fixtures only | n/a | n/a | Driver, dispatcher, and verification-only tests; live SSH/Caddy acceptance pending |
 | `truenas-scale` | n/a -- appliance OS | n/a | 25.10.1 | Uses the WebSocket JSON-RPC API |
 | `supermicro-ipmi` | X11SDV-8C-TP8F | n/a | IPMI 01.25 (08/31/2018) | RSA certs only (see Driver Notes) |
 | `supermicro-ipmi` | X10SDV-TLN4F | n/a | IPMI 03.88 (02/21/2020) | RSA certs only (see Driver Notes) |
@@ -342,6 +453,20 @@ The field is optional. Certs without it send no pings, and certs with no deploym
 2. `sudo my-project/certificates/certbot-setup.sh`
 3. `sudo my-project/certificates/cert-sync.sh`
 4. Done -- renewals and deployments resume automatically
+
+## Offline Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Requires Python 3, Bash, OpenSSL, `jq`, and GNU coreutils. Fixtures redirect fixed installation
+paths into temporary directories and bypass the root check in a copied `cert-sync.sh`.
+They exercise delivery, pipeline and timeout failures, pre/post verification,
+dispatcher skip/failure reporting, and verification-only operation without root or
+external network calls. SSH and the TLS verifier are stand-ins in the sender tests;
+the nginx helper tests use a local TLS server and simulated service commands. Test
+success does not establish live Caddy, nginx, or PVE acceptance.
 
 ## License
 
